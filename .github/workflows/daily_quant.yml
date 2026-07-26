@@ -4,22 +4,26 @@ on:
   workflow_dispatch:
 
   schedule:
-    - cron: "30 7 * * 1-5"
+    - cron: "30 0 * * 1-5"
 
 jobs:
   quant:
 
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+
     steps:
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Install Dependencies
         run: |
@@ -31,7 +35,9 @@ jobs:
           python quant_system.py
 
       - name: Upload Reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: A-Share-Quant-Reports
           path: reports/
+          if-no-files-found: warn
