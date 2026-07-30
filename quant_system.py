@@ -1,2398 +1,364 @@
 # -*- coding: utf-8 -*-
+"""A 股量化分析软件。
 
-"""
-A股 AI Quant Trading System V4.0
-
-功能：
-1. A股股票池
-2. 数据获取
-3. 数据质量检查
-4. ST过滤
-5. 北交所过滤
-6. 科创板/创业板过滤
-7. 多因子评分
-8. 市场环境识别
-9. 动态仓位管理
-10. 组合构建
-11. 止损止盈
-12. 涨跌停过滤
-13. T+1逻辑框架
-14. 交易成本
-15. 滑点
-16. 简易回测
-17. 模拟交易
-18. 每日自动选股
-19. CSV报告
-20. AI分析接口预留
-
-注意：
-本系统默认仅用于研究、回测和模拟交易。
-不会自动进行真实证券账户下单。
+默认提供可离线运行的演示模式，也支持通过 AkShare 获取实时 A 股数据。
+本工具只做研究、回测和模拟分析，不会连接券商或自动下单。
 """
 
+from __future__ import annotations
 
+import argparse
+import json
 import os
 import time
-import math
-import json
 import warnings
+from dataclasses import dataclass, asdict
 from datetime import datetime
+from typing import Iterable
 
 import akshare as ak
 import numpy as np
 import pandas as pd
 import requests
 
-
 warnings.filterwarnings("ignore")
 
-
-# ============================================================
-# CONFIG
-# ============================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPORT_DIR = os.path.join(BASE_DIR, "reports")
+os.makedirs(REPORT_DIR, exist_ok=True)
 
 CONFIG = {
-
-    # -------------------------
-    # 资金
-    # -------------------------
-
     "initial_capital": 50000,
-
-    # 最大持仓数量
     "max_positions": 5,
-
-    # 单票最大仓位
     "max_single_weight": 0.25,
-
-    # 默认单票目标仓位
-    "target_single_weight": 0.20,
-
-    # 最低买入金额
     "min_position_value": 5000,
-
-
-    # -------------------------
-    # 选股
-    # -------------------------
-
     "min_score": 60,
-
-    "strong_score": 80,
-
     "max_candidates": 10,
-
-
-    # -------------------------
-    # 风控
-    # -------------------------
-
     "stop_loss": -0.08,
-
     "take_profit": 0.20,
-
-    "max_drawdown": -0.15,
-
     "max_volatility": 0.60,
-
-
-    # -------------------------
-    # 股票过滤
-    # -------------------------
-
     "exclude_st": True,
-
     "exclude_bj": True,
-
     "exclude_kc": False,
-
     "exclude_cyb": False,
-
-
-    # -------------------------
-    # 回测
-    # -------------------------
-
-    "commission": 0.0003,
-
-    "stamp_tax": 0.0005,
-
-    "slippage": 0.001,
-
-
-    # -------------------------
-    # AI
-    # -------------------------
-
     "ai_enabled": False,
-
     "ai_api_url": "",
-
     "ai_api_key": "",
-
     "ai_model": "",
-
 }
 
-
-# ============================================================
-# PATH
-# ============================================================
-
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-REPORT_DIR = os.path.join(
-    BASE_DIR,
-    "reports"
-)
-
-os.makedirs(
-    REPORT_DIR,
-    exist_ok=True
-)
-
-
-# ============================================================
-# LOG
-# ============================================================
-
-def log(message):
-
-    now = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    print(
-        f"[{now}] {message}"
-    )
-
-
-# ============================================================
-# STOCK LIST
-# ============================================================
-
-def get_stock_list():
-
-    log("正在获取A股股票列表...")
-
-    df = ak.stock_info_a_code_name()
-
-    df = df.rename(
-        columns={
-            "code": "symbol",
-            "name": "name"
-        }
-    )
-
-    return df[
-        [
-            "symbol",
-            "name"
-        ]
+DEMO_STOCKS = pd.DataFrame(
+    [
+        {"symbol": "600519", "name": "贵州茅台", "trend": 0.0009, "vol": 0.016},
+        {"symbol": "000001", "name": "平安银行", "trend": 0.0003, "vol": 0.020},
+        {"symbol": "300750", "name": "宁德时代", "trend": 0.0011, "vol": 0.025},
+        {"symbol": "600036", "name": "招商银行", "trend": 0.0006, "vol": 0.018},
+        {"symbol": "688981", "name": "中芯国际", "trend": 0.0008, "vol": 0.030},
+        {"symbol": "002594", "name": "比亚迪", "trend": 0.0010, "vol": 0.026},
     ]
+)
 
 
-# ============================================================
-# STOCK HISTORY
-# ============================================================
+@dataclass
+class AnalysisResult:
+    symbol: str
+    name: str
+    score: int
+    signal: str
+    regime: str
+    close: float
+    momentum20: float
+    momentum60: float
+    rsi: float
+    volatility: float
+    volume_ratio: float
+    distance_high20: float
+    weight: float = 0.0
+    position_value: float = 0.0
+    ai_analysis: str = "AI分析未启用"
 
-def get_stock_history(
-    symbol
-):
 
+def log(message: str) -> None:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+
+
+def make_demo_history(symbol: str, trend: float = 0.0006, vol: float = 0.02, days: int = 260) -> pd.DataFrame:
+    """生成稳定可复现的演示行情，让首次运行不依赖网络。"""
+    rng = np.random.default_rng(int(symbol[-4:]) if symbol[-4:].isdigit() else 2026)
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=days)
+    returns = rng.normal(trend, vol, days)
+    close = 20 * np.cumprod(1 + returns)
+    open_ = close * (1 + rng.normal(0, vol / 3, days))
+    high = np.maximum(open_, close) * (1 + rng.random(days) * vol)
+    low = np.minimum(open_, close) * (1 - rng.random(days) * vol)
+    volume = rng.integers(80_000, 900_000, days)
+    return pd.DataFrame(
+        {"date": dates, "open": open_, "close": close, "high": high, "low": low, "volume": volume, "amount": volume * close}
+    )
+
+
+def get_stock_list(demo: bool = False, limit: int | None = None) -> pd.DataFrame:
+    if demo:
+        df = DEMO_STOCKS[["symbol", "name"]].copy()
+    else:
+        log("正在获取A股股票列表...")
+        df = ak.stock_info_a_code_name().rename(columns={"code": "symbol", "name": "name"})[["symbol", "name"]]
+    return df.head(limit) if limit else df
+
+
+def get_stock_history(symbol: str, demo: bool = False) -> pd.DataFrame:
+    if demo:
+        row = DEMO_STOCKS.loc[DEMO_STOCKS["symbol"] == symbol]
+        trend = float(row["trend"].iloc[0]) if not row.empty else 0.0006
+        vol = float(row["vol"].iloc[0]) if not row.empty else 0.02
+        return make_demo_history(symbol, trend, vol)
     try:
-
-        df = ak.stock_zh_a_hist(
-
-            symbol=symbol,
-
-            period="daily",
-
-            adjust="qfq"
-        )
-
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq")
         if df.empty:
-
             return pd.DataFrame()
-
-
-        df = df.rename(
-            columns={
-
-                "日期":
-                    "date",
-
-                "开盘":
-                    "open",
-
-                "收盘":
-                    "close",
-
-                "最高":
-                    "high",
-
-                "最低":
-                    "low",
-
-                "成交量":
-                    "volume",
-
-                "成交额":
-                    "amount"
-            }
-        )
-
-
-        df[
-            "date"
-        ] = pd.to_datetime(
-            df[
-                "date"
-            ]
-        )
-
-
-        df = df.sort_values(
-            "date"
-        )
-
-
-        return df.reset_index(
-            drop=True
-        )
-
-
-    except Exception as e:
-
-        log(
-            f"{symbol} 数据获取失败: {e}"
-        )
-
+        df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close", "最高": "high", "最低": "low", "成交量": "volume", "成交额": "amount"})
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date").reset_index(drop=True)
+    except Exception as exc:
+        log(f"{symbol} 数据获取失败: {exc}")
         return pd.DataFrame()
 
 
-# ============================================================
-# MARKET DATA
-# ============================================================
-
-def get_market_data():
-
+def get_market_data(demo: bool = False) -> pd.DataFrame:
+    if demo:
+        return make_demo_history("000300", trend=0.0005, vol=0.014)
     try:
-
-        df = ak.stock_zh_index_daily(
-            symbol="sh000300"
-        )
-
+        df = ak.stock_zh_index_daily(symbol="sh000300")
         if df.empty:
-
             return pd.DataFrame()
-
-
-        df[
-            "date"
-        ] = pd.to_datetime(
-            df[
-                "date"
-            ]
-        )
-
-
-        return df.sort_values(
-            "date"
-        )
-
-
-    except Exception as e:
-
-        log(
-            f"市场指数获取失败: {e}"
-        )
-
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date")
+    except Exception as exc:
+        log(f"市场指数获取失败: {exc}")
         return pd.DataFrame()
 
 
-# ============================================================
-# DATA QUALITY
-# ============================================================
-
-def validate_data(
-    df
-):
-
-    if df is None:
-
-        return False
+def validate_data(df: pd.DataFrame) -> bool:
+    required = {"open", "high", "low", "close", "volume"}
+    return df is not None and not df.empty and len(df) >= 120 and required.issubset(df.columns) and not df["close"].isna().any() and (df["close"] > 0).all()
 
 
-    if df.empty:
-
-        return False
-
-
-    if len(df) < 120:
-
-        return False
-
-
-    required_columns = [
-
-        "open",
-
-        "high",
-
-        "low",
-
-        "close",
-
-        "volume"
-
-    ]
-
-
-    for col in required_columns:
-
-        if col not in df.columns:
-
-            return False
-
-
-    if df[
-        "close"
-    ].isna().any():
-
-        return False
-
-
-    if (
-        df[
-            "close"
-        ] <= 0
-    ).any():
-
-        return False
-
-
-    return True
-
-
-# ============================================================
-# STOCK FILTER
-# ============================================================
-
-def filter_stock(
-    symbol,
-    name
-):
-
+def filter_stock(symbol: str, name: str) -> bool:
     name_upper = name.upper()
-
-
-    # ST过滤
-
-    if (
-
-        CONFIG[
-            "exclude_st"
-        ]
-
-        and
-
-        "ST" in name_upper
-
-    ):
-
+    if CONFIG["exclude_st"] and "ST" in name_upper:
         return False
-
-
-    # 北交所
-
-    if (
-
-        CONFIG[
-            "exclude_bj"
-        ]
-
-        and
-
-        symbol.startswith(
-            "8"
-        )
-
-    ):
-
+    if CONFIG["exclude_bj"] and symbol.startswith("8"):
         return False
-
-
-    # 科创板
-
-    if (
-
-        CONFIG[
-            "exclude_kc"
-        ]
-
-        and
-
-        symbol.startswith(
-            "688"
-        )
-
-    ):
-
+    if CONFIG["exclude_kc"] and symbol.startswith("688"):
         return False
-
-
-    # 创业板
-
-    if (
-
-        CONFIG[
-            "exclude_cyb"
-        ]
-
-        and
-
-        symbol.startswith(
-            "30"
-        )
-
-    ):
-
+    if CONFIG["exclude_cyb"] and symbol.startswith("30"):
         return False
-
-
     return True
 
 
-# ============================================================
-# FACTORS
-# ============================================================
-
-def calculate_factors(
-    df
-):
-
+def calculate_factors(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-
-    # -------------------------
-    # MA
-    # -------------------------
-
-    df[
-        "ma5"
-    ] = (
-        df[
-            "close"
-        ]
-        .rolling(5)
-        .mean()
-    )
-
-
-    df[
-        "ma20"
-    ] = (
-        df[
-            "close"
-        ]
-        .rolling(20)
-        .mean()
-    )
-
-
-    df[
-        "ma60"
-    ] = (
-        df[
-            "close"
-        ]
-        .rolling(60)
-        .mean()
-    )
-
-
-    # -------------------------
-    # 动量
-    # -------------------------
-
-    df[
-        "momentum20"
-    ] = (
-
-        df[
-            "close"
-        ]
-        .pct_change(20)
-
-    )
-
-
-    df[
-        "momentum60"
-    ] = (
-
-        df[
-            "close"
-        ]
-        .pct_change(60)
-
-    )
-
-
-    # -------------------------
-    # 波动率
-    # -------------------------
-
-    returns = (
-
-        df[
-            "close"
-        ]
-        .pct_change()
-
-    )
-
-
-    df[
-        "volatility"
-    ] = (
-
-        returns
-        .rolling(20)
-        .std()
-
-        * np.sqrt(252)
-
-    )
-
-
-    # -------------------------
-    # RSI
-    # -------------------------
-
-    delta = (
-
-        df[
-            "close"
-        ]
-        .diff()
-
-    )
-
-
-    gain = delta.clip(
-        lower=0
-    )
-
-
-    loss = -delta.clip(
-        upper=0
-    )
-
-
-    avg_gain = (
-
-        gain
-        .rolling(14)
-        .mean()
-
-    )
-
-
-    avg_loss = (
-
-        loss
-        .rolling(14)
-        .mean()
-
-    )
-
-
-    rs = (
-
-        avg_gain /
-
-        avg_loss.replace(
-            0,
-            np.nan
-        )
-
-    )
-
-
-    df[
-        "rsi"
-    ] = (
-
-        100 -
-
-        100 /
-        (
-            1 + rs
-        )
-
-    )
-
-
-    # -------------------------
-    # 成交量
-    # -------------------------
-
-    df[
-        "volume_ma20"
-    ] = (
-
-        df[
-            "volume"
-        ]
-        .rolling(20)
-        .mean()
-
-    )
-
-
-    df[
-        "volume_ratio"
-    ] = (
-
-        df[
-            "volume"
-        ]
-
-        /
-
-        df[
-            "volume_ma20"
-        ]
-
-    )
-
-
-    # -------------------------
-    # 20日高点
-    # -------------------------
-
-    df[
-        "high20"
-    ] = (
-
-        df[
-            "high"
-        ]
-        .rolling(20)
-        .max()
-
-    )
-
-
-    # 距离20日高点
-
-    df[
-        "distance_high20"
-    ] = (
-
-        df[
-            "close"
-        ]
-
-        /
-
-        df[
-            "high20"
-        ]
-
-        - 1
-
-    )
-
-
-    # -------------------------
-    # ATR
-    # -------------------------
-
-    tr1 = (
-
-        df[
-            "high"
-        ]
-
-        -
-
-        df[
-            "low"
-        ]
-
-    )
-
-
-    tr2 = (
-
-        df[
-            "high"
-        ]
-
-        -
-
-        df[
-            "close"
-        ]
-        .shift()
-
-    ).abs()
-
-
-    tr3 = (
-
-        df[
-            "low"
-        ]
-
-        -
-
-        df[
-            "close"
-        ]
-        .shift()
-
-    ).abs()
-
-
-    tr = pd.concat(
-
-        [
-            tr1,
-            tr2,
-            tr3
-        ],
-
-        axis=1
-
-    ).max(
-        axis=1
-    )
-
-
-    df[
-        "atr"
-    ] = (
-
-        tr
-        .rolling(14)
-        .mean()
-
-    )
-
-
+    df["ma5"] = df["close"].rolling(5).mean()
+    df["ma20"] = df["close"].rolling(20).mean()
+    df["ma60"] = df["close"].rolling(60).mean()
+    df["momentum20"] = df["close"].pct_change(20)
+    df["momentum60"] = df["close"].pct_change(60)
+    returns = df["close"].pct_change()
+    df["volatility"] = returns.rolling(20).std() * np.sqrt(252)
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    df["rsi"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+    df["volume_ma20"] = df["volume"].rolling(20).mean()
+    df["volume_ratio"] = df["volume"] / df["volume_ma20"]
+    df["high20"] = df["high"].rolling(20).max()
+    df["distance_high20"] = df["close"] / df["high20"] - 1
     return df
 
 
-# ============================================================
-# MARKET REGIME
-# ============================================================
-
-def detect_market_regime(
-    df
-):
-
+def detect_market_regime(df: pd.DataFrame) -> str:
     if df.empty:
-
         return "UNKNOWN"
-
-
-    df = calculate_factors(
-        df
-    )
-
-
-    row = df.iloc[
-        -1
-    ]
-
-
-    if (
-
-        row[
-            "close"
-        ]
-
-        >
-
-        row[
-            "ma20"
-        ]
-
-        >
-
-        row[
-            "ma60"
-        ]
-
-    ):
-
+    row = calculate_factors(df).iloc[-1]
+    if row["close"] > row["ma20"] > row["ma60"]:
         return "BULL"
-
-
-    if (
-
-        row[
-            "close"
-        ]
-
-        <
-
-        row[
-            "ma20"
-        ]
-
-        <
-
-        row[
-            "ma60"
-        ]
-
-    ):
-
+    if row["close"] < row["ma20"] < row["ma60"]:
         return "BEAR"
-
-
     return "SIDEWAYS"
 
 
-# ============================================================
-# MARKET POSITION
-# ============================================================
-
-def get_position_multiplier(
-    regime
-):
-
-    if regime == "BULL":
-
-        return 1.0
+def get_position_multiplier(regime: str) -> float:
+    return {"BULL": 1.0, "SIDEWAYS": 0.6, "BEAR": 0.0}.get(regime, 0.3)
 
 
-    if regime == "SIDEWAYS":
-
-        return 0.6
-
-
-    if regime == "BEAR":
-
-        return 0.0
-
-
-    return 0.3
-
-
-# ============================================================
-# QUANT SCORE
-# ============================================================
-
-def calculate_score(
-    df
-):
-
-    if df.empty:
-
-        return 0
-
-
-    row = df.iloc[
-        -1
-    ]
-
-
+def calculate_score(df: pd.DataFrame) -> int:
+    row = df.iloc[-1]
     score = 0
-
-
-    # -------------------------
-    # 趋势
-    # -------------------------
-
-    if (
-
-        row[
-            "ma5"
-        ]
-
-        >
-
-        row[
-            "ma20"
-        ]
-
-    ):
-
-        score += 10
-
-
-    if (
-
-        row[
-            "ma20"
-        ]
-
-        >
-
-        row[
-            "ma60"
-        ]
-
-    ):
-
-        score += 15
-
-
-    # -------------------------
-    # 动量
-    # -------------------------
-
-    if (
-
-        row[
-            "momentum20"
-        ]
-
-        >
-
-        0.03
-
-    ):
-
-        score += 15
-
-
-    if (
-
-        row[
-            "momentum60"
-        ]
-
-        >
-
-        0.08
-
-    ):
-
-        score += 15
-
-
-    # -------------------------
-    # RSI
-    # -------------------------
-
-    if (
-
-        45
-
-        <=
-
-        row[
-            "rsi"
-        ]
-
-        <=
-
-        70
-
-    ):
-
-        score += 10
-
-
-    # -------------------------
-    # 成交量
-    # -------------------------
-
-    if (
-
-        row[
-            "volume_ratio"
-        ]
-
-        >
-
-        1.1
-
-    ):
-
-        score += 10
-
-
-    # -------------------------
-    # 波动率
-    # -------------------------
-
-    if (
-
-        row[
-            "volatility"
-        ]
-
-        <
-
-        CONFIG[
-            "max_volatility"
-        ]
-
-    ):
-
-        score += 10
-
-
-    # -------------------------
-    # 追高过滤
-    # -------------------------
-
-    if (
-
-        row[
-            "distance_high20"
-        ]
-
-        >
-
-        -0.10
-
-    ):
-
-        score += 5
-
-
-    return min(
-        score,
-        100
-    )
-
-
-# ============================================================
-# SIGNAL
-# ============================================================
-
-def generate_signal(
-    score,
-    regime
-):
-
+    score += 10 if row["ma5"] > row["ma20"] else 0
+    score += 15 if row["ma20"] > row["ma60"] else 0
+    score += 15 if row["momentum20"] > 0.03 else 0
+    score += 15 if row["momentum60"] > 0.08 else 0
+    score += 10 if 45 <= row["rsi"] <= 70 else 0
+    score += 10 if row["volume_ratio"] > 1.1 else 0
+    score += 10 if row["volatility"] < CONFIG["max_volatility"] else 0
+    score += 5 if row["distance_high20"] > -0.10 else 0
+    return min(score, 100)
+
+
+def generate_signal(score: int, regime: str) -> str:
     if regime == "BEAR":
-
         return "WAIT"
-
-
     if score >= 80:
-
         return "STRONG_BUY"
-
-
     if score >= 70:
-
         return "BUY"
-
-
     if score >= 60:
-
         return "WATCH"
-
-
     return "AVOID"
 
 
-# ============================================================
-# LIMIT UP / DOWN FILTER
-# ============================================================
-
-def check_limit_status(
-    df
-):
-
+def check_limit_status(df: pd.DataFrame) -> bool:
     if len(df) < 2:
-
         return False
+    change = df.iloc[-1]["close"] / df.iloc[-2]["close"] - 1
+    return change >= 0.095 or change <= -0.095
 
 
-    today = df.iloc[
-        -1
-    ]
-
-    yesterday = df.iloc[
-        -2
-    ]
-
-
-    change = (
-
-        today[
-            "close"
-        ]
-
-        /
-
-        yesterday[
-            "close"
-        ]
-
-        - 1
-
-    )
-
-
-    # 接近涨停
-
-    if change >= 0.095:
-
-        return True
-
-
-    # 接近跌停
-
-    if change <= -0.095:
-
-        return True
-
-
-    return False
-
-
-# ============================================================
-# POSITION SIZE
-# ============================================================
-
-def calculate_position(
-    score,
-    regime,
-    capital
-):
-
-    multiplier = (
-
-        get_position_multiplier(
-            regime
-        )
-
-    )
-
-
+def calculate_position(score: int, regime: str, capital: float) -> dict[str, float]:
     if score >= 85:
-
         base_weight = 0.25
-
-
     elif score >= 75:
-
         base_weight = 0.20
-
-
     elif score >= 60:
-
         base_weight = 0.15
-
-
     else:
+        base_weight = 0.0
+    weight = min(base_weight * get_position_multiplier(regime), CONFIG["max_single_weight"])
+    return {"weight": weight, "value": capital * weight}
 
-        base_weight = 0
+
+def ai_analysis(stock: AnalysisResult) -> str:
+    if not CONFIG["ai_enabled"]:
+        return "AI分析未启用"
+    payload = {"model": CONFIG["ai_model"], "messages": [{"role": "user", "content": f"请分析A股{stock.name}({stock.symbol})，评分{stock.score}，信号{stock.signal}，给出风险提示。"}]}
+    try:
+        response = requests.post(CONFIG["ai_api_url"], headers={"Authorization": f"Bearer {CONFIG['ai_api_key']}", "Content-Type": "application/json"}, json=payload, timeout=60)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    except Exception as exc:
+        return f"AI分析失败: {exc}"
 
 
-    weight = (
-
-        base_weight
-
-        *
-
-        multiplier
-
+def analyze_stock(symbol: str, name: str, regime: str, demo: bool = False) -> AnalysisResult | None:
+    if not filter_stock(symbol, name):
+        return None
+    df = get_stock_history(symbol, demo=demo)
+    if not validate_data(df) or check_limit_status(df):
+        return None
+    factors = calculate_factors(df)
+    row = factors.iloc[-1]
+    score = calculate_score(factors)
+    signal = generate_signal(score, regime)
+    return AnalysisResult(
+        symbol=symbol,
+        name=name,
+        score=score,
+        signal=signal,
+        regime=regime,
+        close=round(float(row["close"]), 2),
+        momentum20=round(float(row["momentum20"]), 4),
+        momentum60=round(float(row["momentum60"]), 4),
+        rsi=round(float(row["rsi"]), 2),
+        volatility=round(float(row["volatility"]), 4),
+        volume_ratio=round(float(row["volume_ratio"]), 2),
+        distance_high20=round(float(row["distance_high20"]), 4),
     )
 
 
-    weight = min(
-
-        weight,
-
-        CONFIG[
-            "max_single_weight"
-        ]
-
-    )
-
-
-    value = (
-
-        capital
-
-        *
-
-        weight
-
-    )
-
-
-    return {
-
-        "weight":
-            weight,
-
-        "value":
-            value
-
-    }
-
-
-# ============================================================
-# PORTFOLIO
-# ============================================================
-
-def build_portfolio(
-    candidates,
-    regime
-):
-
-    if not candidates:
-
-        return []
-
-
-    candidates = sorted(
-
-        candidates,
-
-        key=lambda x:
-
-        x[
-            "score"
-        ],
-
-        reverse=True
-
-    )
-
-
-    candidates = candidates[
-
-        :
-
-        CONFIG[
-            "max_candidates"
-        ]
-
-    ]
-
-
-    portfolio = []
-
-
-    for item in candidates:
-
-
-        position = (
-
-            calculate_position(
-
-                item[
-                    "score"
-                ],
-
-                regime,
-
-                CONFIG[
-                    "initial_capital"
-                ]
-
-            )
-
-        )
-
-
-        if (
-
-            position[
-                "value"
-            ]
-
-            <
-
-            CONFIG[
-                "min_position_value"
-            ]
-
-        ):
-
+def build_portfolio(candidates: Iterable[AnalysisResult], regime: str, capital: float) -> list[AnalysisResult]:
+    portfolio: list[AnalysisResult] = []
+    for item in sorted(candidates, key=lambda x: x.score, reverse=True)[: CONFIG["max_candidates"]]:
+        position = calculate_position(item.score, regime, capital)
+        if position["value"] < CONFIG["min_position_value"]:
             continue
-
-
-        item = item.copy()
-
-
-        item[
-            "weight"
-        ] = position[
-            "weight"
-        ]
-
-
-        item[
-            "position_value"
-        ] = position[
-            "value"
-        ]
-
-
-        portfolio.append(
-            item
-        )
-
-
-        if len(
-            portfolio
-        ) >= CONFIG[
-            "max_positions"
-        ]:
-
+        item.weight = position["weight"]
+        item.position_value = round(position["value"], 2)
+        item.ai_analysis = ai_analysis(item)
+        portfolio.append(item)
+        if len(portfolio) >= CONFIG["max_positions"]:
             break
-
-
     return portfolio
 
 
-# ============================================================
-# AI ANALYSIS
-# ============================================================
-
-def ai_analysis(
-    stock
-):
-
-    if not CONFIG[
-        "ai_enabled"
-    ]:
-
-        return (
-            "AI分析未启用"
-        )
-
-
-    prompt = f"""
-
-你是一名专业A股量化研究员。
-
-股票：
-{stock['name']}
-
-代码：
-{stock['symbol']}
-
-量化评分：
-{stock['score']}
-
-市场状态：
-{stock['regime']}
-
-20日动量：
-{stock['momentum20']}
-
-60日动量：
-{stock['momentum60']}
-
-RSI：
-{stock['rsi']}
-
-波动率：
-{stock['volatility']}
-
-成交量比：
-{stock['volume_ratio']}
-
-请分析：
-
-1. 趋势
-2. 动量
-3. 风险
-4. 是否追高
-5. 适合买入还是等待
-6. 建议仓位
-7. 止损
-8. 最大风险
-
-不要预测确定收益。
-不要给出确定性涨跌结论。
-"""
-
-
-    headers = {
-
-        "Authorization":
-            "Bearer "
-
-            +
-
-            CONFIG[
-                "ai_api_key"
-            ],
-
-        "Content-Type":
-            "application/json"
-
-    }
-
-
-    payload = {
-
-        "model":
-
-            CONFIG[
-                "ai_model"
-            ],
-
-        "messages":
-
-            [
-
-                {
-
-                    "role":
-                        "user",
-
-                    "content":
-                        prompt
-
-                }
-
-            ]
-
-    }
-
-
-    try:
-
-        response = requests.post(
-
-            CONFIG[
-                "ai_api_url"
-            ],
-
-            headers=headers,
-
-            json=payload,
-
-            timeout=60
-
-        )
-
-
-        response.raise_for_status()
-
-
-        data = response.json()
-
-
-        return (
-
-            data[
-                "choices"
-            ][
-                0
-            ][
-                "message"
-            ][
-                "content"
-            ]
-
-        )
-
-
-    except Exception as e:
-
-        return (
-
-            f"AI分析失败: {e}"
-
-        )
-
-
-# ============================================================
-# SCAN MARKET
-# ============================================================
-
-def scan_market():
-
-    log(
-        "开始扫描A股..."
-    )
-
-
-    stock_list = (
-
-        get_stock_list()
-
-    )
-
-
-    market_df = (
-
-        get_market_data()
-
-    )
-
-
-    regime = (
-
-        detect_market_regime(
-
-            market_df
-
-        )
-
-    )
-
-
-    log(
-
-        f"当前市场状态: {regime}"
-
-    )
-
-
-    candidates = []
-
-
-    total = len(
-        stock_list
-    )
-
-
-    for index, row in (
-
-        stock_list.iterrows()
-
-    ):
-
-
-        symbol = row[
-            "symbol"
-        ]
-
-
-        name = row[
-            "name"
-        ]
-
-
-        if not filter_stock(
-
-            symbol,
-
-            name
-
-        ):
-
-            continue
-
-
-        try:
-
-
-            df = (
-
-                get_stock_history(
-
-                    symbol
-
-                )
-
-            )
-
-
-            if not validate_data(
-
-                df
-
-            ):
-
-                continue
-
-
-            # 涨跌停过滤
-
-            limit_status = (
-
-                check_limit_status(
-
-                    df
-
-                )
-
-            )
-
-
-            if limit_status:
-
-                continue
-
-
-            df = (
-
-                calculate_factors(
-
-                    df
-
-                )
-
-
-            )
-
-
-            row_data = df.iloc[
-                -1
-            ]
-
-
-            score = (
-
-                calculate_score(
-
-                    df
-
-                )
-
-            )
-
-
-            signal = (
-
-                generate_signal(
-
-                    score,
-
-                    regime
-
-                )
-
-            )
-
-
-            if score < CONFIG[
-                "min_score"
-            ]:
-
-                continue
-
-
-            candidate = {
-
-                "symbol":
-                    symbol,
-
-                "name":
-                    name,
-
-                "score":
-                    score,
-
-                "signal":
-                    signal,
-
-                "regime":
-                    regime,
-
-                "close":
-                    round(
-
-                        float(
-
-                            row_data[
-                                "close"
-                            ]
-
-                        ),
-
-                        2
-
-                    ),
-
-                "momentum20":
-                    round(
-
-                        float(
-
-                            row_data[
-                                "momentum20"
-                            ]
-
-                        ),
-
-                        4
-
-                    ),
-
-                "momentum60":
-                    round(
-
-                        float(
-
-                            row_data[
-                                "momentum60"
-                            ]
-
-                        ),
-
-                        4
-
-                    ),
-
-                "rsi":
-                    round(
-
-                        float(
-
-                            row_data[
-                                "rsi"
-                            ]
-
-                        ),
-
-                        2
-
-                    ),
-
-                "volatility":
-                    round(
-
-                        float(
-
-                            row_data[
-                                "volatility"
-                            ]
-
-                        ),
-
-                        4
-
-                    ),
-
-                "volume_ratio":
-                    round(
-
-                        float(
-
-                            row_data[
-                                "volume_ratio"
-                            ]
-
-                        ),
-
-                        2
-
-                    ),
-
-                "distance_high20":
-                    round(
-
-                        float(
-
-                            row_data[
-                                "distance_high20"
-                            ]
-
-                        ),
-
-                        4
-
-                    )
-
-            }
-
-
-            candidates.append(
-
-                candidate
-
-            )
-
-
-            if index % 100 == 0:
-
-                log(
-
-                    f"扫描进度: "
-
-                    f"{index + 1}/"
-
-                    f"{total}"
-
-                )
-
-
-            # 避免接口请求过快
-
-            time.sleep(
-                0.05
-            )
-
-
-        except Exception as e:
-
-            log(
-
-                f"{symbol} "
-
-                f"处理失败: "
-
-                f"{e}"
-
-            )
-
-
-    portfolio = (
-
-        build_portfolio(
-
-            candidates,
-
-            regime
-
-        )
-
-    )
-
-
-    # AI分析
-
-    for stock in portfolio:
-
-        stock[
-            "ai_analysis"
-        ] = (
-
-            ai_analysis(
-
-                stock
-
-            )
-
-        )
-
-
-    return (
-
-        regime,
-
-        candidates,
-
-        portfolio
-
-    )
-
-
-# ============================================================
-# REPORT
-# ============================================================
-
-def save_report(
-
-    regime,
-
-    candidates,
-
-    portfolio
-
-):
-
-    today = datetime.now().strftime(
-
-        "%Y%m%d"
-
-    )
-
-
-    candidate_file = (
-
-        os.path.join(
-
-            REPORT_DIR,
-
-            f"candidates_"
-
-            f"{today}.csv"
-
-        )
-
-    )
-
-
-    portfolio_file = (
-
-        os.path.join(
-
-            REPORT_DIR,
-
-            f"portfolio_"
-
-            f"{today}.csv"
-
-        )
-
-    )
-
-
-    if candidates:
-
-        pd.DataFrame(
-
-            candidates
-
-        ).to_csv(
-
-            candidate_file,
-
-            index=False,
-
-            encoding="utf-8-sig"
-
-        )
-
-
-    if portfolio:
-
-        pd.DataFrame(
-
-            portfolio
-
-        ).to_csv(
-
-            portfolio_file,
-
-            index=False,
-
-            encoding="utf-8-sig"
-
-        )
-
-
-    # JSON摘要
-
-    summary = {
-
-        "date":
-            today,
-
-        "market_regime":
-            regime,
-
-        "candidate_count":
-            len(
-                candidates
-            ),
-
-        "portfolio_count":
-            len(
-                portfolio
-            ),
-
-        "portfolio":
-            portfolio
-
-    }
-
-
-    json_file = (
-
-        os.path.join(
-
-            REPORT_DIR,
-
-            f"summary_"
-
-            f"{today}.json"
-
-        )
-
-    )
-
-
-    with open(
-
-        json_file,
-
-        "w",
-
-        encoding="utf-8"
-
-    ) as f:
-
-        json.dump(
-
-            summary,
-
-            f,
-
-            ensure_ascii=False,
-
-            indent=2,
-
-            default=str
-
-        )
-
-
-    log(
-
-        f"报告已保存到: "
-
-        f"{REPORT_DIR}"
-
-    )
-
-
-# ============================================================
-# PRINT RESULT
-# ============================================================
-
-def print_result(
-
-    regime,
-
-    candidates,
-
-    portfolio
-
-):
-
-    print(
-
-        "\n"
-
-        + "=" * 70
-
-    )
-
-
-    print(
-
-        "A股 AI Quant V4.0"
-
-    )
-
-
-    print(
-
-        "=" * 70
-
-    )
-
-
-    print(
-
-        f"市场状态: {regime}"
-
-    )
-
-
-    print(
-
-        f"候选股票: "
-
-        f"{len(candidates)}"
-
-    )
-
-
-    print(
-
-        f"最终组合: "
-
-        f"{len(portfolio)}"
-
-    )
-
-
-    print(
-
-        "\n"
-
-        + "-" * 70
-
-    )
-
-
+def scan_market(demo: bool = False, limit: int | None = None, capital: float | None = None) -> tuple[str, list[AnalysisResult], list[AnalysisResult]]:
+    log("开始扫描A股..." + ("（演示模式）" if demo else ""))
+    stock_list = get_stock_list(demo=demo, limit=limit)
+    regime = detect_market_regime(get_market_data(demo=demo))
+    log(f"当前市场状态: {regime}")
+    candidates: list[AnalysisResult] = []
+    for index, row in stock_list.iterrows():
+        result = analyze_stock(str(row["symbol"]), str(row["name"]), regime, demo=demo)
+        if result and result.score >= CONFIG["min_score"]:
+            candidates.append(result)
+        if not demo and index % 100 == 0:
+            log(f"扫描进度: {index + 1}/{len(stock_list)}")
+        if not demo:
+            time.sleep(0.05)
+    portfolio = build_portfolio(candidates, regime, capital or CONFIG["initial_capital"])
+    return regime, candidates, portfolio
+
+
+def save_report(regime: str, candidates: list[AnalysisResult], portfolio: list[AnalysisResult]) -> None:
+    today = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidates_data = [asdict(item) for item in candidates]
+    portfolio_data = [asdict(item) for item in portfolio]
+    if candidates_data:
+        pd.DataFrame(candidates_data).to_csv(os.path.join(REPORT_DIR, f"candidates_{today}.csv"), index=False, encoding="utf-8-sig")
+    if portfolio_data:
+        pd.DataFrame(portfolio_data).to_csv(os.path.join(REPORT_DIR, f"portfolio_{today}.csv"), index=False, encoding="utf-8-sig")
+    with open(os.path.join(REPORT_DIR, f"summary_{today}.json"), "w", encoding="utf-8") as file:
+        json.dump({"date": today, "market_regime": regime, "candidate_count": len(candidates), "portfolio_count": len(portfolio), "portfolio": portfolio_data}, file, ensure_ascii=False, indent=2)
+    log(f"报告已保存到: {REPORT_DIR}")
+
+
+def print_result(regime: str, candidates: list[AnalysisResult], portfolio: list[AnalysisResult]) -> None:
+    print("\n" + "=" * 72)
+    print("A股量化分析软件（研究/模拟，不自动交易）")
+    print("=" * 72)
+    print(f"市场状态: {regime} | 候选股票: {len(candidates)} | 最终组合: {len(portfolio)}")
     if not portfolio:
-
-        print(
-
-            "当前没有满足条件的股票。"
-
-        )
-
-        print(
-
-            "系统建议：等待。"
-
-        )
-
+        print("当前没有满足条件的股票，系统建议：等待。")
         return
-
-
-    for i, stock in enumerate(
-
-        portfolio,
-
-        start=1
-
-    ):
-
-
-        print(
-
-            f"\n"
-
-            f"{i}. "
-
-            f"{stock['symbol']} "
-
-            f"{stock['name']}"
-
-        )
-
-
-        print(
-
-            f"评分: "
-
-            f"{stock['score']}"
-
-        )
-
-
-        print(
-
-            f"信号: "
-
-            f"{stock['signal']}"
-
-        )
-
-
-        print(
-
-            f"当前价格: "
-
-            f"{stock['close']}"
-
-        )
-
-
-        print(
-
-            f"建议仓位: "
-
-            f"{stock['weight']:.2%}"
-
-        )
-
-
-        print(
-
-            f"建议金额: "
-
-            f"{stock['position_value']:.2f}"
-
-        )
-
-
-        print(
-
-            f"RSI: "
-
-            f"{stock['rsi']}"
-
-        )
-
-
-        print(
-
-            f"20日动量: "
-
-            f"{stock['momentum20']}"
-
-        )
-
-
-        print(
-
-            f"60日动量: "
-
-            f"{stock['momentum60']}"
-
-        )
-
-
-        print(
-
-            f"波动率: "
-
-            f"{stock['volatility']}"
-
-        )
-
-
-        print(
-
-            f"距离20日高点: "
-
-            f"{stock['distance_high20']}"
-
-        )
-
-
-        print(
-
-            "止损参考: "
-
-            f"{CONFIG['stop_loss']:.2%}"
-
-        )
-
-
-        print(
-
-            "止盈参考: "
-
-            f"{CONFIG['take_profit']:.2%}"
-
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    print(
-
-        "\n"
-
-        "======================================"
-
-    )
-
-
-    print(
-
-        "A股 AI 量化交易系统 V4.0"
-
-    )
-
-
-    print(
-
-        "======================================"
-
-    )
-
-
-    print(
-
-        "初始资金: "
-
-        f"{CONFIG['initial_capital']}"
-
-    )
-
-
-    print(
-
-        "最大持仓: "
-
-        f"{CONFIG['max_positions']}"
-
-    )
-
-
-    print(
-
-        "止损: "
-
-        f"{CONFIG['stop_loss']:.2%}"
-
-    )
-
-
-    print(
-
-        "止盈: "
-
-        f"{CONFIG['take_profit']:.2%}"
-
-    )
-
-
-    print(
-
-        "AI: "
-
-        +
-
-        (
-
-            "开启"
-
-            if CONFIG[
-                "ai_enabled"
-            ]
-
-            else
-
-            "关闭"
-
-        )
-
-    )
-
-
-    try:
-
-
-        regime, candidates, portfolio = (
-
-            scan_market()
-
-        )
-
-
-        print_result(
-
-            regime,
-
-            candidates,
-
-            portfolio
-
-        )
-
-
-        save_report(
-
-            regime,
-
-            candidates,
-
-            portfolio
-
-        )
-
-
-    except Exception as e:
-
-        log(
-
-            f"系统运行失败: {e}"
-
-        )
-
-        raise
+    for index, stock in enumerate(portfolio, start=1):
+        print(f"\n{index}. {stock.symbol} {stock.name}")
+        print(f"评分/信号: {stock.score} / {stock.signal}")
+        print(f"价格: {stock.close} | 建议仓位: {stock.weight:.2%} | 建议金额: {stock.position_value:.2f}")
+        print(f"RSI: {stock.rsi} | 20日动量: {stock.momentum20} | 60日动量: {stock.momentum60}")
+        print(f"波动率: {stock.volatility} | 距离20日高点: {stock.distance_high20}")
+        print(f"止损参考: {CONFIG['stop_loss']:.2%} | 止盈参考: {CONFIG['take_profit']:.2%}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="可直接运行的A股量化分析软件")
+    parser.add_argument("--demo", action="store_true", help="使用内置演示数据，离线也能立即跑通")
+    parser.add_argument("--limit", type=int, default=None, help="限制扫描股票数量，便于快速试跑")
+    parser.add_argument("--capital", type=float, default=CONFIG["initial_capital"], help="模拟资金")
+    parser.add_argument("--min-score", type=int, default=CONFIG["min_score"], help="最低入选评分")
+    parser.add_argument("--no-report", action="store_true", help="只打印结果，不保存报告")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    CONFIG["initial_capital"] = args.capital
+    CONFIG["min_score"] = args.min_score
+    print("\nA股量化分析软件 V5.0")
+    print(f"模式: {'演示数据' if args.demo else '真实行情'} | 资金: {args.capital:.2f} | 最低评分: {args.min_score}")
+    regime, candidates, portfolio = scan_market(demo=args.demo, limit=args.limit, capital=args.capital)
+    print_result(regime, candidates, portfolio)
+    if not args.no_report:
+        save_report(regime, candidates, portfolio)
 
 
 if __name__ == "__main__":
-
     main()
