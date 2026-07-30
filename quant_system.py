@@ -36,6 +36,7 @@ import time
 import math
 import json
 import warnings
+import argparse
 from datetime import datetime
 
 import akshare as ak
@@ -81,6 +82,9 @@ CONFIG = {
     "strong_score": 80,
 
     "max_candidates": 10,
+
+    # 扫描股票数量上限；None 表示扫描全部股票
+    "scan_limit": None,
 
 
     # -------------------------
@@ -1281,6 +1285,10 @@ def build_portfolio(
 
     portfolio = []
 
+    remaining_capital = CONFIG[
+        "initial_capital"
+    ]
+
 
     for item in candidates:
 
@@ -1304,11 +1312,20 @@ def build_portfolio(
         )
 
 
-        if (
+        position_value = min(
 
             position[
                 "value"
-            ]
+            ],
+
+            remaining_capital
+
+        )
+
+
+        if (
+
+            position_value
 
             <
 
@@ -1326,16 +1343,25 @@ def build_portfolio(
 
         item[
             "weight"
-        ] = position[
-            "weight"
-        ]
+        ] = (
+
+            position_value
+
+            /
+
+            CONFIG[
+                "initial_capital"
+            ]
+
+        )
 
 
         item[
             "position_value"
-        ] = position[
-            "value"
-        ]
+        ] = position_value
+
+
+        remaining_capital -= position_value
 
 
         portfolio.append(
@@ -1554,6 +1580,18 @@ def scan_market():
 
 
     candidates = []
+
+
+    scan_limit = CONFIG.get(
+        "scan_limit"
+    )
+
+
+    if scan_limit is not None:
+
+        stock_list = stock_list.head(
+            int(scan_limit)
+        )
 
 
     total = len(
@@ -2263,10 +2301,69 @@ def print_result(
 
 
 # ============================================================
+# CLI
+# ============================================================
+
+def parse_args():
+
+    parser = argparse.ArgumentParser(
+        description="A股量化选股与模拟组合工具（仅研究，不自动实盘下单）"
+    )
+
+    parser.add_argument(
+        "--capital",
+        type=float,
+        default=CONFIG["initial_capital"],
+        help="初始资金，默认读取 CONFIG['initial_capital']"
+    )
+
+    parser.add_argument(
+        "--max-positions",
+        type=int,
+        default=CONFIG["max_positions"],
+        help="最大持仓数量"
+    )
+
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=CONFIG["min_score"],
+        help="进入候选池的最低量化评分"
+    )
+
+    parser.add_argument(
+        "--scan-limit",
+        type=int,
+        default=CONFIG["scan_limit"],
+        help="仅扫描前 N 只股票，便于快速试跑；默认扫描全市场"
+    )
+
+    parser.add_argument(
+        "--enable-ai",
+        action="store_true",
+        help="启用 AI 分析；需同时在 CONFIG 中配置接口地址、Key 和模型"
+    )
+
+    return parser.parse_args()
+
+
+def apply_cli_config(args):
+
+    CONFIG["initial_capital"] = args.capital
+    CONFIG["max_positions"] = args.max_positions
+    CONFIG["min_score"] = args.min_score
+    CONFIG["scan_limit"] = args.scan_limit
+    CONFIG["ai_enabled"] = args.enable_ai
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
+
+    args = parse_args()
+    apply_cli_config(args)
 
     print(
 
